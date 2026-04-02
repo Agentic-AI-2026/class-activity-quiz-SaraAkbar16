@@ -14,6 +14,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
 
+try:
+	from api_keys import ANTHROPIC_API_KEY, GEMINI_API_KEY
+except Exception:
+	ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+	GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
 
 PLAN_SYSTEM = """Break the user goal into an ordered JSON list of steps.
 Each step MUST follow this EXACT schema:
@@ -73,10 +79,15 @@ CITY_COORDS = {
 
 
 class GraphState(TypedDict):
+	# goal: original user request for the full run
 	goal: str
+	# plan: human-readable step descriptions shown in state
 	plan: list[str]
+	# step_details: structured steps used by executor logic
 	step_details: list[dict[str, Any]]
+	# current_step: zero-based pointer to the next step to run
 	current_step: int
+	# results: accumulated outputs in execution order
 	results: list[str]
 
 
@@ -391,7 +402,7 @@ def get_llm() -> Any:
 	except Exception:
 		pass
 
-	anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+	anthropic_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
 	if anthropic_key:
 		try:
 			from langchain_anthropic import ChatAnthropic
@@ -404,7 +415,7 @@ def get_llm() -> Any:
 		except Exception:
 			pass
 
-	gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+	gemini_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 	if gemini_key:
 		try:
 			from langchain_google_genai import ChatGoogleGenerativeAI
@@ -425,6 +436,7 @@ def get_llm() -> Any:
 
 async def get_mcp_tools() -> dict[str, Any]:
 	global _tool_cache
+	# Reuse cached tools so each loop iteration does not reconnect to MCP.
 	if _tool_cache is not None:
 		return _tool_cache
 
@@ -438,6 +450,7 @@ async def get_mcp_tools() -> dict[str, Any]:
 		tools.extend(server_tools)
 
 	tool_map = {tool.name: tool for tool in tools}
+	# Keep local tools as a safety net when MCP servers are unavailable.
 	for name, local_tool in build_local_tool_map().items():
 		tool_map.setdefault(name, local_tool)
 	_tool_cache = tool_map
@@ -511,6 +524,7 @@ def normalize_args(tool_name: str, raw_args: Any) -> dict[str, Any]:
 
 
 async def planner_node(state: GraphState) -> dict[str, Any]:
+	# Phase 1: generate the full ordered plan from the goal.
 	raw_plan = safe_llm_text(
 		[SystemMessage(content=PLAN_SYSTEM), HumanMessage(content=state["goal"])],
 		purpose="plan",
@@ -535,15 +549,18 @@ async def executor_node(state: GraphState) -> dict[str, Any]:
 	current_step = state.get("current_step", 0)
 	results = list(state.get("results", []))
 
+	# Stop guard: nothing to execute if all steps are already completed.
 	if current_step >= len(plan):
 		return {"results": results, "current_step": current_step}
 
+	# Phase 2: execute exactly one step per node invocation.
 	step = plan[current_step]
 	print(f"Executing step {step.get('step', current_step + 1)}: {step.get('description', '')}")
 
 	tool_map = await get_mcp_tools()
 	tool_name = resolve_tool_name(step.get("tool"))
 
+	# Tool path: call the selected tool with normalized arguments.
 	if tool_name and tool_name in tool_map:
 		args = normalize_args(tool_name, step.get("args") or {})
 		if tool_name == "search_web" and not args.get("query"):
@@ -552,6 +569,7 @@ async def executor_node(state: GraphState) -> dict[str, Any]:
 			args["city"] = step.get("description", "")
 		result = await tool_map[tool_name].ainvoke(args)
 	else:
+		# Synthesis path: no tool required, use LLM reasoning with prior context.
 		context = "\n".join(results)
 		step_description = step.get("description", "")
 		prompt = step_description
@@ -563,6 +581,7 @@ async def executor_node(state: GraphState) -> dict[str, Any]:
 	print(f"  Result: {result_text[:200]}")
 
 	results.append(result_text)
+	# Advance by one so the graph loop runs the next step on the next pass.
 	return {
 		"results": results,
 		"current_step": current_step + 1,
@@ -570,10 +589,12 @@ async def executor_node(state: GraphState) -> dict[str, Any]:
 
 
 def route_after_execution(state: GraphState) -> str:
+	# Continue looping until every planned step is executed.
 	return "end" if state.get("current_step", 0) >= len(state.get("plan", [])) else "continue"
 
 
 def build_graph() -> Any:
+	# Graph flow: START -> planner -> executor -> (executor loop) -> END.
 	workflow = StateGraph(GraphState)
 	workflow.add_node("planner_node", planner_node)
 	workflow.add_node("executor_node", executor_node)
