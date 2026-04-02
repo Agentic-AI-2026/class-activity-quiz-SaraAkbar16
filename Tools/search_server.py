@@ -3,11 +3,23 @@
 # STABLE MCP SERVER using Tavily API
 # ============================================================
 
+import os
+import sys
+from pathlib import Path
+
 from mcp.server.fastmcp import FastMCP
 from tavily import TavilyClient
 
-# Replace with your actual key from tavily.com
-TAVILY_API_KEY = "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"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
+try:
+    from api_keys import TAVILY_API_KEY as LOCAL_TAVILY_API_KEY
+except Exception:
+    LOCAL_TAVILY_API_KEY = ""
+
+TAVILY_API_KEY = LOCAL_TAVILY_API_KEY or os.getenv("TAVILY_API_KEY", "")
 
 mcp = FastMCP("search")
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
